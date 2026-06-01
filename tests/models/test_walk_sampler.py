@@ -1,5 +1,4 @@
 import torch
-import pytest
 from prostrencoder.models.walk_sampler import WalkSampler
 
 
