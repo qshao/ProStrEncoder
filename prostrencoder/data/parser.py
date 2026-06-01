@@ -27,7 +27,10 @@ def parse_structure(filepath: str) -> dict:
         parser = PDBParser(QUIET=True)
 
     structure = parser.get_structure("prot", filepath)
-    model = next(structure.get_models())
+    try:
+        model = next(structure.get_models())
+    except StopIteration:
+        raise ValueError(f"No models found in {filepath}")
 
     seq_idx_list, ca_list, bb_list = [], [], []
 

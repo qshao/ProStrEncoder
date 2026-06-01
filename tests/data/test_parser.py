@@ -36,6 +36,9 @@ def test_parse_structure_residue_count(pdb_file):
     assert result["seq_idx"].shape == (3,)
     assert result["ca_coords"].shape == (3, 3)
     assert result["backbone_coords"].shape == (3, 4, 3)
+    assert result["seq_idx"].dtype == np.int64
+    assert result["ca_coords"].dtype == np.float32
+    assert result["backbone_coords"].dtype == np.float32
 
 def test_parse_structure_aa_types(pdb_file):
     result = parse_structure(pdb_file)
