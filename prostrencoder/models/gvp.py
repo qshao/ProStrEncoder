@@ -123,13 +123,11 @@ class GVPConv(nn.Module):
         """
         src, dst = edge_index[0], edge_index[1]
         N = node_s.shape[0]
-        E = src.shape[0]  # actual number of edges from edge_index
+        E = edge_index.shape[1]  # actual number of edges from edge_index
 
-        # Clip edge features to match the number of edges in edge_index.
-        # This handles cases where edge feature tensors are pre-allocated
-        # with a capacity larger than the actual edge count.
-        edge_s = edge_s[:E]
-        edge_v = edge_v[:E]
+        # Assert that edge features match the number of edges in edge_index
+        assert edge_s.shape[0] == E, f"edge_s has {edge_s.shape[0]} rows but edge_index has {E} edges"
+        assert edge_v.shape[0] == E, f"edge_v has {edge_v.shape[0]} rows but edge_index has {E} edges"
 
         # ── Build messages ────────────────────────────────────────────────────
         m_s = torch.cat([node_s[src], edge_s], dim=-1)          # (E, s_n+s_e)

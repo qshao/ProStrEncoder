@@ -68,10 +68,11 @@ def test_gvpconv_output_shapes():
         edge_in_dims=(16, 1),
         node_out_dims=(128, 16),
     )
-    N, E = 10, 20
+    N = 10
+    edge_index = make_chain_graph(N)        # 18 edges for N=10
+    E = edge_index.shape[1]
     node_s, node_v = rand_node_features(N, 43, 3)
     edge_s, edge_v = rand_edge_features(E, 16, 1)
-    edge_index = make_chain_graph(N)[:, :E]
     out_s, out_v = conv(node_s, node_v, edge_index, edge_s, edge_v)
     assert out_s.shape == (N, 128)
     assert out_v.shape == (N, 16, 3)
