@@ -2,11 +2,10 @@ data:
   pdb_dir: data/pdb
   processed_dir: data/processed
   k_neighbors: 30
-  rwse_steps: 16
 
 model:
   num_layers: 3
-  node_scalar_in: 43      # 21 AA + 6 torsion + 16 RWSE
+  node_scalar_in: 91      # 27 (21 AA + 6 torsion) + 64 (walk embedding)
   node_vector_in: 3       # backbone frame vectors
   edge_scalar_in: 16      # RBF distances
   edge_vector_in: 1       # direction vector
@@ -14,6 +13,12 @@ model:
   hidden_vector: 16
   output_dim: 512
   dropout: 0.1
+  # Walk-sequence encoder (CyberGFM-inspired, Option C)
+  num_walks: 8
+  walk_length: 20
+  walk_embed_dim: 64
+  walk_layers: 4
+  walk_heads: 4
 
 training:
   batch_size: 32

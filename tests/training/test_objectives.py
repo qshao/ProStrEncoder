@@ -6,7 +6,7 @@ def test_apply_masking_mask_rate():
     """~15% of residues should be masked."""
     N = 1000
     seq_idx = torch.randint(0, 20, (N,))
-    masked_scalar, mask = apply_masking(seq_idx, torch.randn(N, 43), mask_rate=0.15)
+    masked_scalar, mask = apply_masking(seq_idx, torch.randn(N, 27), mask_rate=0.15)
     assert mask.dtype == torch.bool
     assert mask.shape == (N,)
     frac = mask.float().mean().item()
@@ -16,7 +16,7 @@ def test_apply_masking_zeros_masked_positions():
     """Masked positions in x_scalar should be zeroed out."""
     N = 50
     seq_idx = torch.randint(0, 20, (N,))
-    x_scalar = torch.ones(N, 43)
+    x_scalar = torch.ones(N, 27)
     masked_scalar, mask = apply_masking(seq_idx, x_scalar, mask_rate=0.5)
     # Masked positions (mask=True) should have x_scalar = 0
     assert torch.all(masked_scalar[mask] == 0.0)
@@ -25,7 +25,7 @@ def test_apply_masking_zeros_masked_positions():
 
 def test_apply_masking_returns_bool_tensor():
     seq_idx = torch.randint(0, 20, (20,))
-    _, mask = apply_masking(seq_idx, torch.randn(20, 43))
+    _, mask = apply_masking(seq_idx, torch.randn(20, 27))
     assert mask.dtype == torch.bool
 
 def test_masked_residue_loss_shape():
@@ -74,7 +74,7 @@ from prostrencoder.models.gnn import ResidueHead
 def _fake_batch(n=30, e=60):
     data = Data(
         seq_idx=torch.randint(0, 20, (n,)),
-        x_scalar=torch.randn(n, 43),
+        x_scalar=torch.randn(n, 27),
         x_vec=torch.randn(n, 3, 3),
         edge_index=torch.randint(0, n, (2, e)),
         edge_scalar=torch.randn(e, 16),
@@ -85,10 +85,15 @@ def _fake_batch(n=30, e=60):
 def test_training_step_computes_gradient():
     config = {
         "num_layers": 1,
-        "node_scalar_in": 43, "node_vector_in": 3,
+        "node_scalar_in": 91, "node_vector_in": 3,
         "edge_scalar_in": 16, "edge_vector_in": 1,
         "hidden_scalar": 32, "hidden_vector": 4,
         "output_dim": 64, "dropout": 0.0,
+        "num_walks": 8,
+        "walk_length": 20,
+        "walk_embed_dim": 64,
+        "walk_layers": 4,
+        "walk_heads": 4,
     }
     encoder = ProStrEncoder(config)
     head = ResidueHead(in_dim=32 + 4)
