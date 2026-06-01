@@ -30,7 +30,7 @@ def compute_rwse(edge_index: np.ndarray, num_nodes: int,
 
     # Row-stochastic P = D^{-1} A
     deg = np.array(A.sum(axis=1), dtype=np.float64).flatten()
-    inv_deg = np.where(deg > 0, 1.0 / deg, 0.0)
+    inv_deg = np.divide(1.0, deg, out=np.zeros_like(deg), where=(deg > 0))
     D_inv = csr_matrix(
         (inv_deg, (np.arange(N), np.arange(N))), shape=(N, N)
     )
