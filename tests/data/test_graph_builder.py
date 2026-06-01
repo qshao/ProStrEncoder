@@ -52,3 +52,22 @@ def test_knn_graph_distances_match_euclidean():
     for i in range(len(src)):
         expected = np.linalg.norm(coords[dst[i]] - coords[src[i]])
         assert abs(edge_dist[i] - expected) < 1e-4
+
+def test_knn_graph_nan_coords_excluded():
+    """Residues with NaN Cα coordinates must not appear in any edge."""
+    coords = np.array([
+        [0.0, 0.0, 0.0],
+        [np.nan, np.nan, np.nan],  # residue 1 has missing Cα
+        [3.8, 0.0, 0.0],
+    ], dtype=np.float32)
+    edge_index, edge_dist = build_knn_graph(coords, k=2)
+    src, dst = edge_index
+    assert not np.any(src == 1), "NaN node must have no outgoing edges"
+    assert not np.any(dst == 1), "NaN node must have no incoming edges"
+
+def test_knn_graph_single_residue():
+    """A single residue produces an empty graph (no self-loops possible)."""
+    coords = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
+    edge_index, edge_dist = build_knn_graph(coords, k=5)
+    assert edge_index.shape == (2, 0)
+    assert edge_dist.shape == (0,)

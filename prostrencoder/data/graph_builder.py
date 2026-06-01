@@ -25,6 +25,9 @@ def build_knn_graph(ca_coords: np.ndarray, k: int = 30):
     k_actual = min(k + 1, n)  # +1 because query includes self
     tree = cKDTree(coords)
     dists, indices = tree.query(coords, k=k_actual)
+    # Ensure 2D even when n=1 or k_actual=1
+    dists = np.atleast_2d(dists)
+    indices = np.atleast_2d(indices)
 
     src_list, dst_list, dist_list = [], [], []
     for i in range(n):
@@ -33,6 +36,16 @@ def build_knn_graph(ca_coords: np.ndarray, k: int = 30):
                 src_list.append(i)
                 dst_list.append(int(j))
                 dist_list.append(d)
+
+    # Filter edges involving NaN residues
+    if nan_mask.any():
+        keep = [
+            i for i, (s, d) in enumerate(zip(src_list, dst_list))
+            if not nan_mask[s] and not nan_mask[d]
+        ]
+        src_list = [src_list[i] for i in keep]
+        dst_list = [dst_list[i] for i in keep]
+        dist_list = [dist_list[i] for i in keep]
 
     edge_index = np.array([src_list, dst_list], dtype=np.int64)
     edge_dist = np.array(dist_list, dtype=np.float32)
