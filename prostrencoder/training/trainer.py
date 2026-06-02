@@ -2,7 +2,6 @@
 import json
 import math
 import os
-import time
 
 import torch
 import torch.nn as nn
@@ -114,8 +113,8 @@ class Trainer:
         return params
 
     def _build_phase1_optimizer(self):
-        self.params = self._phase1_params()
-        self.optimizer = AdamW(self.params, lr=self._peak_lr,
+        params = self._phase1_params()
+        self.optimizer = AdamW(params, lr=self._peak_lr,
                                weight_decay=self._weight_decay)
 
     def _transition_to_phase2(self):
@@ -142,10 +141,25 @@ class Trainer:
                      list(self.inv_fold_head.parameters()))
 
         current_lr = self.scheduler.get_last_lr()[0] if self._step > 0 else self._peak_lr
-        self.optimizer = AdamW([
+
+        # Build new optimizer with param groups for phase 2
+        old_state = {id(p): s for p, s in self.optimizer.state.items()}
+        new_opt = AdamW([
             {"params": gvp_params, "lr": current_lr * self._gvp_lr_mult},
             {"params": tx_params,  "lr": current_lr},
         ], weight_decay=self._weight_decay)
+
+        # Transfer accumulated Adam momentum/second-moment state for surviving GVP params
+        for group in new_opt.param_groups:
+            for p in group["params"]:
+                if id(p) in old_state:
+                    new_opt.state[p] = old_state[id(p)]
+
+        self.optimizer = new_opt
+
+        # Rebuild scheduler for the remaining step budget so cosine decay continues
+        remaining = max(1, self._total_steps - self._step)
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=remaining)
 
     # ── Forward + loss ──────────────────────────────────────────────────────────
 
@@ -233,6 +247,7 @@ class Trainer:
             return float("nan")
         self.encoder.eval()
         self.masked_head.eval()
+        self.inv_fold_head.eval()
         total = 0.0
         for batch in self.val_loader:
             loss, _ = self._forward_loss(batch)

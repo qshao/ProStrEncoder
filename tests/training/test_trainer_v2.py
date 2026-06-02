@@ -82,6 +82,28 @@ def test_trainer_v2_two_param_groups_in_phase2():
     assert abs(lr0 / lr1 - 0.1) < 1e-6, "Group 0 must be 0.1x group 1 LR"
 
 
+def test_trainer_v2_scheduler_decays_in_phase2():
+    """LR must decrease in Phase 2 (scheduler must follow new optimizer)."""
+    from prostrencoder.training.trainer import Trainer
+    dataset = _toy_dataset(n_proteins=20)
+    cfg = {**V2_CONFIG}
+    cfg["training"] = {**V2_CONFIG["training"],
+                       "warmup_phase_fraction": 0.0,
+                       "max_epochs": 10,
+                       "inverse_fold_prob": 0.0}
+    trainer = Trainer(cfg, dataset, device="cpu")
+    trainer._transition_to_phase2()
+    lr_before = trainer.optimizer.param_groups[-1]["lr"]
+    # Run several scheduler steps
+    for _ in range(20):
+        trainer.scheduler.step()
+    lr_after = trainer.optimizer.param_groups[-1]["lr"]
+    assert lr_after < lr_before, (
+        f"LR did not decay after phase transition: {lr_before} -> {lr_after}. "
+        "Scheduler may be orphaned."
+    )
+
+
 def test_trainer_v2_loss_decreases():
     from prostrencoder.training.trainer import Trainer
     torch.manual_seed(42)
