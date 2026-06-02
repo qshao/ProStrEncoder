@@ -86,8 +86,9 @@ class ProStrEncoder(nn.Module):
             self.transformer = None
             proj_in = s_h + v_h
 
-        # Phase flag: set to True by Trainer when Phase 2 begins
-        self.use_transformer: bool = False
+        # Phase flag persisted as a bool buffer so it survives checkpoint save/load.
+        # Trainer sets this via encoder.set_phase(2) at the phase transition.
+        self.register_buffer("_use_transformer", torch.tensor(False))
 
         # ── Output projection ─────────────────────────────────────────────────
         self.out_proj = nn.Sequential(
@@ -96,6 +97,14 @@ class ProStrEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(out, out),
         )
+
+    @property
+    def use_transformer(self) -> bool:
+        return bool(self._use_transformer.item())
+
+    @use_transformer.setter
+    def use_transformer(self, value: bool) -> None:
+        self._use_transformer.fill_(1 if value else 0)
 
     @property
     def hidden_dim(self) -> int:
@@ -123,6 +132,7 @@ class ProStrEncoder(nn.Module):
 
         cum = torch.zeros(B + 1, dtype=torch.long, device=device)
         cum[1:] = counts.cumsum(0)
+        # batch_idx is guaranteed sorted by PyG Batch.from_data_list
         pos = torch.arange(N, device=device) - cum[batch_idx]     # within-protein pos
 
         # Scatter into padded tensor
@@ -165,9 +175,10 @@ class ProStrEncoder(nn.Module):
         if self.transformer is not None:
             if self.use_transformer:
                 # Phase 2: full transformer (bridge + attention layers + norm)
-                batch_idx = getattr(batch, "batch",
-                                    torch.zeros(node_s.shape[0], dtype=torch.long,
-                                                device=node_s.device))
+                batch_idx = getattr(batch, "batch", None)
+                if batch_idx is None:
+                    batch_idx = torch.zeros(node_s.shape[0], dtype=torch.long,
+                                            device=node_s.device)
                 hidden = self._transformer_forward(gvp_out, batch_idx)
             else:
                 # Phase 1: bridge only — no attention, no extra compute
