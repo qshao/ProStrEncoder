@@ -1,12 +1,14 @@
 import torch
 import pytest
-from prostrencoder.training.objectives import MaskedResidueLoss, apply_masking
+from prostrencoder.training.objectives import MaskedResidueLoss, apply_masking, MASK_AA
 
 def test_apply_masking_mask_rate():
     """~15% of residues should be masked."""
     N = 1000
     seq_idx = torch.randint(0, 20, (N,))
-    masked_scalar, mask = apply_masking(seq_idx, torch.randn(N, 27), mask_rate=0.15)
+    masked_scalar, masked_seq_idx, mask = apply_masking(
+        seq_idx, torch.randn(N, 27), mask_rate=0.15
+    )
     assert mask.dtype == torch.bool
     assert mask.shape == (N,)
     frac = mask.float().mean().item()
@@ -17,15 +19,22 @@ def test_apply_masking_zeros_masked_positions():
     N = 50
     seq_idx = torch.randint(0, 20, (N,))
     x_scalar = torch.ones(N, 27)
-    masked_scalar, mask = apply_masking(seq_idx, x_scalar, mask_rate=0.5)
-    # Masked positions (mask=True) should have x_scalar = 0
+    masked_scalar, masked_seq_idx, mask = apply_masking(seq_idx, x_scalar, mask_rate=0.5)
     assert torch.all(masked_scalar[mask] == 0.0)
-    # Unmasked positions should be unchanged
     assert torch.all(masked_scalar[~mask] == 1.0)
+
+def test_apply_masking_seq_idx_masked():
+    """Masked positions in seq_idx should be replaced with MASK_AA; others unchanged."""
+    N = 200
+    seq_idx = torch.randint(0, 20, (N,))
+    _, masked_seq_idx, mask = apply_masking(seq_idx, torch.randn(N, 27), mask_rate=0.15)
+    assert (masked_seq_idx[mask] == MASK_AA).all(), "Masked positions must equal MASK_AA"
+    assert (masked_seq_idx[~mask] == seq_idx[~mask]).all(), "Unmasked positions must be unchanged"
+    assert not (seq_idx == MASK_AA).any(), "Original seq_idx must not be modified"
 
 def test_apply_masking_returns_bool_tensor():
     seq_idx = torch.randint(0, 20, (20,))
-    _, mask = apply_masking(seq_idx, torch.randn(20, 27))
+    _, _, mask = apply_masking(seq_idx, torch.randn(20, 27))
     assert mask.dtype == torch.bool
 
 def test_masked_residue_loss_shape():
@@ -100,14 +109,67 @@ def test_training_step_computes_gradient():
     loss_fn = MaskedResidueLoss()
 
     batch = _fake_batch()
-    masked_scalar, mask = apply_masking(batch.seq_idx, batch.x_scalar)
+    targets = batch.seq_idx.clone()
+    masked_scalar, masked_seq_idx, mask = apply_masking(batch.seq_idx, batch.x_scalar)
     batch.x_scalar = masked_scalar
+    batch.seq_idx = masked_seq_idx
 
     _, hidden = encoder(batch, return_hidden=True)
     logits = head(hidden)
-    loss = loss_fn(logits, batch.seq_idx, mask)
+    loss = loss_fn(logits, targets, mask)
     loss.backward()
 
     for p in encoder.parameters():
         if p.requires_grad and p.grad is not None:
             assert torch.isfinite(p.grad).all()
+
+
+# --- Inverse folding objective ---
+
+from prostrencoder.training.objectives import InverseFoldingLoss, sample_batch_mode
+
+
+def test_inverse_folding_loss_shape():
+    N = 50
+    loss_fn = InverseFoldingLoss()
+    logits  = torch.randn(N, 21)
+    targets = torch.randint(0, 21, (N,))
+    loss = loss_fn(logits, targets)
+    assert loss.ndim == 0, "loss must be scalar"
+    assert loss.item() > 0
+
+
+def test_inverse_folding_loss_all_positions():
+    """Loss must use all N positions (unlike masked loss which uses ~15%)."""
+    N = 100
+    loss_fn = InverseFoldingLoss()
+    logits  = torch.zeros(N, 21)
+    logits[:, 0] = 100.0   # model predicts class 0 for every residue
+    targets = torch.zeros(N, dtype=torch.long)   # true label = 0
+    loss = loss_fn(logits, targets)
+    # Near-zero loss because predictions match targets
+    assert loss.item() < 0.01, f"Expected near-zero loss, got {loss.item()}"
+
+
+def test_inverse_folding_loss_weighted():
+    """pLDDT weights zero out low-confidence residues."""
+    N = 20
+    loss_fn = InverseFoldingLoss()
+    logits  = torch.randn(N, 21)
+    targets = torch.randint(0, 21, (N,))
+    weights = torch.zeros(N)   # all zero -> loss must be 0
+    loss = loss_fn(logits, targets, weights=weights)
+    assert loss.item() == 0.0
+
+
+def test_sample_batch_mode_returns_a_or_b():
+    modes = {sample_batch_mode(0.3) for _ in range(50)}
+    assert modes == {"A", "B"}
+
+
+def test_sample_batch_mode_prob_zero_always_a():
+    assert all(sample_batch_mode(0.0) == "A" for _ in range(10))
+
+
+def test_sample_batch_mode_prob_one_always_b():
+    assert all(sample_batch_mode(1.0) == "B" for _ in range(10))
