@@ -1,5 +1,9 @@
-import os
+# prostrencoder/training/trainer.py
+import json
 import math
+import os
+import time
+
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -8,91 +12,218 @@ from torch_geometric.loader import DataLoader
 
 from prostrencoder.models.encoder import ProStrEncoder
 from prostrencoder.models.gnn import ResidueHead
-from prostrencoder.training.objectives import apply_masking, MaskedResidueLoss
+from prostrencoder.training.objectives import (
+    apply_masking, MaskedResidueLoss, InverseFoldingLoss, sample_batch_mode,
+)
 
 
 class Trainer:
     """
-    Self-supervised pre-training loop for ProStrEncoder via masked residue
-    type prediction.
+    Two-phase pre-training loop for ProStrEncoder v2.
 
-    Args:
-        config       : dict loaded from configs/default.yaml
-        train_dataset: ProteinDataset (preprocessed .pt files)
-        val_dataset  : ProteinDataset or None
-        device       : 'cuda' or 'cpu'
+    Phase 1 (warmup_phase_fraction of total steps):
+      - GVP + WalkEncoder + bridge + masked_head in optimizer (single group)
+      - encoder.use_transformer = False -> bridge-only forward, no attention
+      - Objective: masked residue prediction (Mode A) only
+
+    Phase 2 (remaining steps):
+      - encoder.use_transformer = True -> full transformer forward
+      - Optimizer group 0: GVP + WalkEncoder at lr * gvp_lr_multiplier
+      - Optimizer group 1: transformer layers + heads at lr
+      - Alternating batches: Mode A (1 - inverse_fold_prob) or Mode B (inverse_fold_prob)
+
+    Precision:
+      - precision=fp32 -> no autocast (default, CPU-safe)
+      - precision=bf16 -> torch.amp.autocast BF16 (CUDA only, no GradScaler needed)
     """
 
-    def __init__(self, config, train_dataset, val_dataset=None, device="cpu"):
+    def __init__(self, config: dict, train_dataset, val_dataset=None,
+                 device: str = "cpu"):
         self.config = config
         self.device = torch.device(device)
+        train_cfg = config["training"]
 
         self.encoder = ProStrEncoder(config["model"]).to(self.device)
 
-        hidden_dim = config["model"]["hidden_scalar"] + config["model"]["hidden_vector"]
-        self.head = ResidueHead(hidden_dim).to(self.device)
+        hidden_dim = self.encoder.hidden_dim
+        self.masked_head   = ResidueHead(hidden_dim).to(self.device)
+        self.inv_fold_head = ResidueHead(hidden_dim).to(self.device)
 
-        params = list(self.encoder.parameters()) + list(self.head.parameters())
-        self.optimizer = AdamW(params,
-                               lr=config["training"]["lr"],
-                               weight_decay=config["training"]["weight_decay"])
+        self.masked_loss_fn   = MaskedResidueLoss()
+        self.inv_fold_loss_fn = InverseFoldingLoss()
 
-        self.loss_fn = MaskedResidueLoss()
-        self.mask_rate = config["training"]["mask_rate"]
-        self.grad_clip = config["training"]["grad_clip"]
+        self.mask_rate        = train_cfg["mask_rate"]
+        self.grad_clip        = train_cfg["grad_clip"]
+        self.inv_fold_prob    = train_cfg.get("inverse_fold_prob", 0.3)
+        self.inv_fold_weight  = train_cfg.get("inverse_fold_weight", 1.0)
+        self.precision        = train_cfg.get("precision", "fp32")
+        self.log_every        = train_cfg["log_every"]
+        self.save_every_steps = train_cfg.get("save_every_steps", 1000)
+
+        num_workers = train_cfg.get("num_workers", 4)
+        pin_memory  = (self.device.type == "cuda")
 
         self.train_loader = DataLoader(
             train_dataset,
-            batch_size=config["training"]["batch_size"],
+            batch_size=train_cfg["batch_size"],
             shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
         )
         self.val_loader = DataLoader(
             val_dataset,
-            batch_size=config["training"]["batch_size"],
+            batch_size=train_cfg["batch_size"],
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
         ) if val_dataset is not None else None
 
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=config["training"]["max_epochs"] * len(self.train_loader),
-        )
+        total_steps = train_cfg["max_epochs"] * len(self.train_loader)
+        warmup_steps = max(1, int(total_steps * train_cfg.get("warmup_phase_fraction", 0.05)))
+        self._warmup_steps   = warmup_steps
+        self._total_steps    = total_steps
+        self._gvp_lr_mult    = train_cfg.get("gvp_lr_multiplier", 0.1)
+        self._peak_lr        = train_cfg["lr"]
+        self._weight_decay   = train_cfg["weight_decay"]
+        self._step           = 0
+        self._phase          = 1
 
-        os.makedirs(config["training"]["checkpoint_dir"], exist_ok=True)
-        self.ckpt_dir = config["training"]["checkpoint_dir"]
-        self.log_every = config["training"]["log_every"]
+        # Phase 1 optimizer: GVP + WalkEncoder + bridge + masked_head + out_proj
+        self._build_phase1_optimizer()
+
+        # Cosine LR schedule runs across both phases without reset
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=total_steps)
+
+        os.makedirs(train_cfg["checkpoint_dir"], exist_ok=True)
+        self.ckpt_dir = train_cfg["checkpoint_dir"]
+
+    # ── Optimizer builders ─────────────────────────────────────────────────────
+
+    def _phase1_params(self):
+        """All params active during Phase 1."""
+        params = (list(self.encoder.walk_sampler.parameters()) +
+                  list(self.encoder.walk_encoder.parameters()) +
+                  list(self.encoder.node_in.parameters()) +
+                  list(self.encoder.edge_in.parameters()) +
+                  list(self.encoder.layers.parameters()))
+        if self.encoder.transformer is not None:
+            params += list(self.encoder.transformer.bridge.parameters())
+        params += (list(self.encoder.out_proj.parameters()) +
+                   list(self.masked_head.parameters()))
+        return params
+
+    def _build_phase1_optimizer(self):
+        self.params = self._phase1_params()
+        self.optimizer = AdamW(self.params, lr=self._peak_lr,
+                               weight_decay=self._weight_decay)
+
+    def _transition_to_phase2(self):
+        """Switch to Phase 2: activate transformer, add second LR group."""
+        if self.encoder.transformer is None:
+            # No transformer configured — stay as single group
+            return
+        self.encoder.use_transformer = True
+        self._phase = 2
+
+        # Group 0: GVP + WalkEncoder + bridge (conservative LR)
+        gvp_params = (list(self.encoder.walk_sampler.parameters()) +
+                      list(self.encoder.walk_encoder.parameters()) +
+                      list(self.encoder.node_in.parameters()) +
+                      list(self.encoder.edge_in.parameters()) +
+                      list(self.encoder.layers.parameters()) +
+                      list(self.encoder.transformer.bridge.parameters()))
+
+        # Group 1: transformer layers + norm + both heads + out_proj (full LR)
+        tx_params = (list(self.encoder.transformer.layers.parameters()) +
+                     list(self.encoder.transformer.norm.parameters()) +
+                     list(self.encoder.out_proj.parameters()) +
+                     list(self.masked_head.parameters()) +
+                     list(self.inv_fold_head.parameters()))
+
+        current_lr = self.scheduler.get_last_lr()[0] if self._step > 0 else self._peak_lr
+        self.optimizer = AdamW([
+            {"params": gvp_params, "lr": current_lr * self._gvp_lr_mult},
+            {"params": tx_params,  "lr": current_lr},
+        ], weight_decay=self._weight_decay)
+
+    # ── Forward + loss ──────────────────────────────────────────────────────────
+
+    @property
+    def _use_amp(self) -> bool:
+        return self.precision == "bf16" and self.device.type == "cuda"
 
     def _forward_loss(self, batch):
         batch = batch.to(self.device)
+        targets = batch.seq_idx.clone()
 
-        masked_scalar, mask = apply_masking(
-            batch.seq_idx, batch.x_scalar, mask_rate=self.mask_rate
-        )
-        batch.x_scalar = masked_scalar
+        # In Phase 1 always use Mode A; in Phase 2 alternate
+        if self._phase == 1:
+            mode = "A"
+        else:
+            mode = sample_batch_mode(self.inv_fold_prob)
 
-        _, hidden = self.encoder(batch, return_hidden=True)
-        logits = self.head(hidden)           # (N_total, 21)
-        loss = self.loss_fn(logits, batch.seq_idx, mask)
-        return loss
+        if mode == "A":
+            masked_scalar, masked_seq_idx, mask = apply_masking(
+                batch.seq_idx, batch.x_scalar, mask_rate=self.mask_rate
+            )
+            batch.x_scalar = masked_scalar
+            batch.seq_idx  = masked_seq_idx
+
+        amp_dtype = torch.bfloat16 if self._use_amp else torch.float32
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=self._use_amp):
+            _, hidden = self.encoder(batch, return_hidden=True)
+            if mode == "A":
+                logits = self.masked_head(hidden)
+                loss   = self.masked_loss_fn(logits, targets, mask)
+            else:
+                logits  = self.inv_fold_head(hidden)
+                weights = getattr(batch, "plddt", None)
+                loss    = self.inv_fold_loss_fn(logits, targets, weights=weights)
+                loss    = loss * self.inv_fold_weight
+
+        return loss, mode
+
+    # ── Training loop ──────────────────────────────────────────────────────────
 
     def train_epoch(self, epoch: int) -> float:
         self.encoder.train()
-        self.head.train()
+        self.masked_head.train()
+        self.inv_fold_head.train()
         total_loss = 0.0
 
-        for step, batch in enumerate(self.train_loader):
+        for step_in_epoch, batch in enumerate(self.train_loader):
+            # Phase transition check
+            if self._phase == 1 and self._step >= self._warmup_steps:
+                self._transition_to_phase2()
+
             self.optimizer.zero_grad()
-            loss = self._forward_loss(batch)
+            loss, mode = self._forward_loss(batch)
             loss.backward()
-            nn.utils.clip_grad_norm_(
-                list(self.encoder.parameters()) + list(self.head.parameters()),
-                self.grad_clip,
-            )
+
+            all_params = []
+            for pg in self.optimizer.param_groups:
+                all_params += pg["params"]
+            nn.utils.clip_grad_norm_(all_params, self.grad_clip)
+
             self.optimizer.step()
             self.scheduler.step()
+            self._step += 1
             total_loss += loss.item()
 
-            if (step + 1) % self.log_every == 0:
-                avg = total_loss / (step + 1)
-                print(f"  Epoch {epoch} step {step+1}/{len(self.train_loader)}  loss={avg:.4f}")
+            if (step_in_epoch + 1) % self.log_every == 0:
+                lrs = [pg["lr"] for pg in self.optimizer.param_groups]
+                record = {
+                    "step": self._step, "epoch": epoch, "mode": mode,
+                    "loss": round(loss.item(), 6),
+                    "perplexity": round(math.exp(min(loss.item(), 20)), 4),
+                    "lr": lrs[-1],
+                    "phase": self._phase,
+                }
+                print(json.dumps(record))
+
+            if self._step % self.save_every_steps == 0:
+                self.save_checkpoint(epoch, float("nan"))
 
         return total_loss / len(self.train_loader)
 
@@ -101,28 +232,38 @@ class Trainer:
         if self.val_loader is None:
             return float("nan")
         self.encoder.eval()
-        self.head.eval()
+        self.masked_head.eval()
         total = 0.0
         for batch in self.val_loader:
-            total += self._forward_loss(batch).item()
+            loss, _ = self._forward_loss(batch)
+            total += loss.item()
         return total / len(self.val_loader)
 
     def save_checkpoint(self, epoch: int, val_loss: float):
-        path = os.path.join(self.ckpt_dir, f"ckpt_epoch{epoch:03d}_val{val_loss:.4f}.pt")
+        tag = (f"step{self._step:07d}" if math.isnan(val_loss)
+               else f"epoch{epoch:03d}_val{val_loss:.4f}")
+        path = os.path.join(self.ckpt_dir, f"ckpt_{tag}.pt")
         torch.save({
             "epoch": epoch,
+            "step": self._step,
+            "phase": self._phase,
             "encoder": self.encoder.state_dict(),
-            "head": self.head.state_dict(),
+            "masked_head": self.masked_head.state_dict(),
+            "inv_fold_head": self.inv_fold_head.state_dict(),
             "optimizer": self.optimizer.state_dict(),
+            "config": self.config,
         }, path)
-        print(f"Saved checkpoint: {path}")
+        print(json.dumps({"event": "checkpoint", "path": path}))
 
     def fit(self):
         best_val = math.inf
         for epoch in range(1, self.config["training"]["max_epochs"] + 1):
             train_loss = self.train_epoch(epoch)
             val_loss   = self.val_epoch()
-            print(f"Epoch {epoch:3d}  train={train_loss:.4f}  val={val_loss:.4f}")
+            print(json.dumps({"event": "epoch", "epoch": epoch,
+                               "train_loss": round(train_loss, 6),
+                               "val_loss": round(val_loss, 6) if not math.isnan(val_loss) else None,
+                               "phase": self._phase}))
             if val_loss < best_val:
                 best_val = val_loss
                 self.save_checkpoint(epoch, val_loss)
