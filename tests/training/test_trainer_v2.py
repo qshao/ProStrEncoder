@@ -104,6 +104,28 @@ def test_trainer_v2_scheduler_decays_in_phase2():
     )
 
 
+def test_transition_to_phase2_with_mock_ddp_wrapper():
+    """_transition_to_phase2 must work when encoder is wrapped in a DDP-like shell."""
+    from prostrencoder.training.trainer import Trainer
+
+    dataset = _toy_dataset(n_proteins=6)
+    cfg = {**V2_CONFIG}
+    cfg["training"] = {**V2_CONFIG["training"], "warmup_phase_fraction": 0.0}
+    trainer = Trainer(cfg, dataset, device="cpu")
+
+    # Simulate DDP wrapping: store encoder as .module attribute of a shell object
+    class MockDDP:
+        def __init__(self, module):
+            self.module = module
+        def parameters(self):
+            return self.module.parameters()
+
+    trainer.encoder = MockDDP(trainer.encoder)
+    # Must not raise AttributeError
+    trainer._transition_to_phase2()
+    assert trainer._raw_encoder().use_transformer is True
+
+
 def test_trainer_v2_loss_decreases():
     from prostrencoder.training.trainer import Trainer
     torch.manual_seed(42)

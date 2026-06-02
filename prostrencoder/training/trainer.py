@@ -99,16 +99,22 @@ class Trainer:
 
     # ── Optimizer builders ─────────────────────────────────────────────────────
 
+    def _raw_encoder(self):
+        """Return the underlying ProStrEncoder, unwrapping DDP/FSDP if present."""
+        enc = self.encoder
+        return enc.module if hasattr(enc, "module") else enc
+
     def _phase1_params(self):
         """All params active during Phase 1."""
-        params = (list(self.encoder.walk_sampler.parameters()) +
-                  list(self.encoder.walk_encoder.parameters()) +
-                  list(self.encoder.node_in.parameters()) +
-                  list(self.encoder.edge_in.parameters()) +
-                  list(self.encoder.layers.parameters()))
-        if self.encoder.transformer is not None:
-            params += list(self.encoder.transformer.bridge.parameters())
-        params += (list(self.encoder.out_proj.parameters()) +
+        enc = self._raw_encoder()
+        params = (list(enc.walk_sampler.parameters()) +
+                  list(enc.walk_encoder.parameters()) +
+                  list(enc.node_in.parameters()) +
+                  list(enc.edge_in.parameters()) +
+                  list(enc.layers.parameters()))
+        if enc.transformer is not None:
+            params += list(enc.transformer.bridge.parameters())
+        params += (list(enc.out_proj.parameters()) +
                    list(self.masked_head.parameters()))
         return params
 
@@ -119,24 +125,25 @@ class Trainer:
 
     def _transition_to_phase2(self):
         """Switch to Phase 2: activate transformer, add second LR group."""
-        if self.encoder.transformer is None:
+        enc = self._raw_encoder()
+        if enc.transformer is None:
             # No transformer configured — stay as single group
             return
-        self.encoder.use_transformer = True
+        enc.use_transformer = True   # accesses buffer via property setter
         self._phase = 2
 
         # Group 0: GVP + WalkEncoder + bridge (conservative LR)
-        gvp_params = (list(self.encoder.walk_sampler.parameters()) +
-                      list(self.encoder.walk_encoder.parameters()) +
-                      list(self.encoder.node_in.parameters()) +
-                      list(self.encoder.edge_in.parameters()) +
-                      list(self.encoder.layers.parameters()) +
-                      list(self.encoder.transformer.bridge.parameters()))
+        gvp_params = (list(enc.walk_sampler.parameters()) +
+                      list(enc.walk_encoder.parameters()) +
+                      list(enc.node_in.parameters()) +
+                      list(enc.edge_in.parameters()) +
+                      list(enc.layers.parameters()) +
+                      list(enc.transformer.bridge.parameters()))
 
         # Group 1: transformer layers + norm + both heads + out_proj (full LR)
-        tx_params = (list(self.encoder.transformer.layers.parameters()) +
-                     list(self.encoder.transformer.norm.parameters()) +
-                     list(self.encoder.out_proj.parameters()) +
+        tx_params = (list(enc.transformer.layers.parameters()) +
+                     list(enc.transformer.norm.parameters()) +
+                     list(enc.out_proj.parameters()) +
                      list(self.masked_head.parameters()) +
                      list(self.inv_fold_head.parameters()))
 

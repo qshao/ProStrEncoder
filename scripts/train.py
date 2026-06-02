@@ -151,8 +151,8 @@ def main():
             trainer, epoch, val_loss
         )
 
-    # DDP: each rank sees different data via DistributedSampler
-    if strategy == "ddp":
+    # DDP and FSDP: each rank sees different data via DistributedSampler
+    if strategy in ("ddp", "fsdp"):
         from torch.utils.data import DistributedSampler
         from torch_geometric.loader import DataLoader
         sampler = DistributedSampler(train_ds, num_replicas=world_size,
@@ -163,6 +163,7 @@ def main():
             sampler=sampler,
             num_workers=config["training"].get("num_workers", 4),
             pin_memory=True,
+            persistent_workers=(config["training"].get("num_workers", 4) > 0),
         )
 
     trainer.fit()
