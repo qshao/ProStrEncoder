@@ -1,6 +1,8 @@
 data:
   pdb_dir: data/pdb
   processed_dir: data/processed
+  train_dir: data/toy/train    # update to your preprocessed data before training
+  val_dir: data/toy/val        # update to your preprocessed data before training
   k_neighbors: 30
 
 model:
@@ -19,6 +21,15 @@ model:
   walk_embed_dim: 64
   walk_layers: 4
   walk_heads: 4
+  max_deg_cap: 30   # = k_neighbors; avoids GPU-CPU sync in WalkSampler
+  # Global transformer (v2) — set tx_layers: 0 to disable (v1 behavior)
+  tx_layers: 0
+  tx_d_model: 512
+  tx_num_heads: 8
+  tx_ff_mult: 4
+  tx_dropout: 0.1
+  attn_window_size: -1     # -1 = full attention; >0 = sliding window per side
+  gradient_checkpointing: false
 
 training:
   batch_size: 32
@@ -29,3 +40,26 @@ training:
   grad_clip: 1.0
   checkpoint_dir: checkpoints
   log_every: 50
+  num_workers: 4    # DataLoader worker processes; 0 = main-process only
+  # v2 training
+  precision: fp32                # "fp32" | "bf16"  (bf16 requires CUDA + flash_attn)
+  gvp_lr_multiplier: 0.1        # GVP LR = lr * this during Phase 2
+  warmup_phase_fraction: 0.05   # Phase 1 length as fraction of total steps
+  inverse_fold_prob: 0.3        # fraction of batches using inverse folding loss
+  inverse_fold_weight: 1.0      # λ — inverse folding loss scale factor
+  save_every_steps: 1000
+  device_strategy: single_gpu   # "single_gpu" | "ddp" | "fsdp"
+
+evaluation:
+  probe_epochs: 100
+  probe_lr: 0.01
+  probe_weight_decay: 0.0001
+
+toy_data:
+  out_dir: data/toy
+  n_train: 100
+  n_val: 20
+  n_test: 20
+  min_len: 40
+  max_len: 150
+  seed: 42
