@@ -9,11 +9,6 @@ try:
     HAS_FLASH_ATTN = True
 except ImportError:
     HAS_FLASH_ATTN = False
-    warnings.warn(
-        "flash_attn not installed — falling back to torch.nn.MultiheadAttention. "
-        "Install with: pip install flash-attn --no-build-isolation",
-        stacklevel=2,
-    )
 
 
 class GlobalTransformerLayer(nn.Module):
@@ -48,6 +43,7 @@ class GlobalTransformerLayer(nn.Module):
                 in_features=d_model,
                 hidden_features=d_model * ff_mult,
                 activation=nn.functional.silu,
+                dropout=dropout,
             )
             self._use_flash = True
         else:
@@ -65,6 +61,17 @@ class GlobalTransformerLayer(nn.Module):
                 nn.Dropout(dropout),
             )
             self._use_flash = False
+            warnings.warn(
+                "flash_attn not installed — using torch.nn.MultiheadAttention fallback. "
+                "Install with: pip install flash-attn --no-build-isolation",
+                stacklevel=2,
+            )
+            if window_size != -1:
+                warnings.warn(
+                    f"window_size={window_size} requested but flash_attn is not installed. "
+                    "Full attention will be used instead.",
+                    stacklevel=2,
+                )
 
     def forward(self, x: torch.Tensor,
                 key_padding_mask: torch.Tensor = None) -> torch.Tensor:
@@ -79,6 +86,7 @@ class GlobalTransformerLayer(nn.Module):
             normed = self.norm1(x)
             attn_out, _ = self.attn(normed, normed, normed,
                                     key_padding_mask=key_padding_mask)
+            attn_out = torch.nan_to_num(attn_out, nan=0.0)  # guard all-padding sequences
             x = x + attn_out
         x = x + self.ff(self.norm2(x))
         return x

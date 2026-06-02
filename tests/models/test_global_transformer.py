@@ -66,7 +66,7 @@ def test_transformer_gradient_checkpointing():
 
 
 @pytest.mark.skipif(not HAS_FLASH_ATTN, reason="flash_attn not installed")
-def test_flash_attn_layer_matches_fallback_shape():
+def test_flash_attn_layer_output_shape():
     """Flash and fallback layers produce the same output shape."""
     from prostrencoder.models.global_transformer import GlobalTransformerLayer
     x = torch.randn(2, 16, 64)
