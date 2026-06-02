@@ -5,22 +5,26 @@ x_scalar stores only AA one-hot (21) + torsion angles (6) = 27 dims.
 The 64-dim walk embedding is computed online inside ProStrEncoder.forward()
 and is no longer stored in the .pt file.
 
-Usage:
-    python scripts/preprocess.py --pdb_dir data/pdb --out_dir data/processed --k 30
+YAML config provides default paths and k-NN value; CLI args override them.
+
+Usage (YAML defaults):
+    python scripts/preprocess.py --config configs/default.yaml
+
+Usage (full CLI override):
+    python scripts/preprocess.py --config configs/default.yaml \\
+        --pdb_dir /data/rcsb --out_dir data/processed --k 20
 """
 import argparse
 import os
-import numpy as np
+
 import torch
+import yaml
 from torch_geometric.data import Data
 from tqdm import tqdm
 
-from prostrencoder.data.parser import parse_structure
+from prostrencoder.data.features import build_pyg_data
 from prostrencoder.data.graph_builder import build_knn_graph
-from prostrencoder.data.features import (
-    aa_one_hot, compute_backbone_frame, compute_torsion_angles,
-    rbf_encoding, compute_edge_directions,
-)
+from prostrencoder.data.parser import parse_structure
 
 
 def preprocess_one(pdb_path: str, k: int) -> Data:
@@ -30,51 +34,75 @@ def preprocess_one(pdb_path: str, k: int) -> Data:
 
     edge_index, edge_dist = build_knn_graph(parsed["ca_coords"], k=k)
 
-    onehot  = aa_one_hot(parsed["seq_idx"])                         # (N, 21)
-    torsion = compute_torsion_angles(parsed["backbone_coords"])      # (N, 6)
-    frame   = compute_backbone_frame(parsed["backbone_coords"])      # (N, 3, 3)
-    rbf     = rbf_encoding(edge_dist)                                # (E, 16)
-    dirs    = compute_edge_directions(
-                  parsed["ca_coords"], edge_index, edge_dist)        # (E, 3)
-
-    x_scalar = np.concatenate([onehot, torsion], axis=1).astype(np.float32)  # (N, 27)
-    e_vec    = dirs[:, np.newaxis, :].astype(np.float32)                      # (E, 1, 3)
-
-    return Data(
-        seq_idx=torch.from_numpy(parsed["seq_idx"]),
-        x_scalar=torch.from_numpy(x_scalar),
-        x_vec=torch.from_numpy(frame),
-        edge_index=torch.from_numpy(edge_index),
-        edge_scalar=torch.from_numpy(rbf),
-        edge_vec=torch.from_numpy(e_vec),
+    return build_pyg_data(
+        parsed["seq_idx"], parsed["ca_coords"], parsed["backbone_coords"],
+        edge_index, edge_dist,
     )
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--pdb_dir", required=True)
-    parser.add_argument("--out_dir", required=True)
-    parser.add_argument("--k",       type=int, default=30)
+    parser = argparse.ArgumentParser(
+        description="Preprocess PDB/mmCIF files into PyG .pt graph objects."
+    )
+    parser.add_argument("--config",  default="configs/default.yaml",
+                        help="YAML config file (provides default paths and k)")
+    parser.add_argument("--pdb_dir", default=None,
+                        help="Input directory of .pdb/.cif files "
+                             "(overrides config.data.pdb_dir)")
+    parser.add_argument("--out_dir", default=None,
+                        help="Output directory for .pt files "
+                             "(overrides config.data.processed_dir)")
+    parser.add_argument("--k",       type=int, default=None,
+                        help="k-NN neighbours (overrides config.data.k_neighbors)")
     args = parser.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    pdb_files = [f for f in os.listdir(args.pdb_dir)
-                 if f.endswith((".pdb", ".cif"))]
+    with open(args.config) as f:
+        config = yaml.safe_load(f)
 
-    skipped = 0
-    for fname in tqdm(pdb_files, desc="Preprocessing"):
-        stem = os.path.splitext(fname)[0]
-        out_path = os.path.join(args.out_dir, stem + ".pt")
-        if os.path.exists(out_path):
-            continue
+    data_cfg  = config.get("data", {})
+    pdb_dir   = args.pdb_dir or data_cfg.get("pdb_dir", "data/pdb")
+    out_dir   = args.out_dir or data_cfg.get("processed_dir", "data/processed")
+    k         = args.k if args.k is not None else data_cfg.get("k_neighbors", 30)
+    n_workers = data_cfg.get("preprocess_workers", 1)
+
+    print(f"pdb_dir  : {pdb_dir}")
+    print(f"out_dir  : {out_dir}")
+    print(f"k-NN     : {k}")
+    print(f"workers  : {n_workers}")
+
+    os.makedirs(out_dir, exist_ok=True)
+    pdb_files = [f for f in os.listdir(pdb_dir) if f.endswith((".pdb", ".cif"))]
+    pending   = [f for f in pdb_files
+                 if not os.path.exists(os.path.join(out_dir,
+                                                     os.path.splitext(f)[0] + ".pt"))]
+    print(f"Files pending: {len(pending)}/{len(pdb_files)}")
+
+    if not pending:
+        print("Nothing to do.")
+        return
+
+    def _worker(fname):
+        stem     = os.path.splitext(fname)[0]
+        out_path = os.path.join(out_dir, stem + ".pt")
         try:
-            data = preprocess_one(os.path.join(args.pdb_dir, fname), args.k)
+            data = preprocess_one(os.path.join(pdb_dir, fname), k)
             torch.save(data, out_path)
+            return None
         except Exception as e:
-            print(f"Skipping {fname}: {e}")
-            skipped += 1
+            return f"{fname}: {e}"
 
-    print(f"Done. Skipped {skipped}/{len(pdb_files)} files.")
+    if n_workers <= 1:
+        errors = [_worker(f) for f in tqdm(pending, desc="Preprocessing")]
+    else:
+        from multiprocessing import Pool
+        with Pool(processes=n_workers) as pool:
+            errors = list(tqdm(pool.imap(_worker, pending),
+                               total=len(pending), desc="Preprocessing"))
+
+    skipped = [e for e in errors if e is not None]
+    for e in skipped:
+        print(f"Skipped: {e}")
+    print(f"Done. Skipped {len(skipped)}/{len(pending)} files.")
 
 
 if __name__ == "__main__":
