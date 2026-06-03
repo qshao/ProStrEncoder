@@ -114,8 +114,12 @@ def main():
 
     device = torch.device(args.device)
     encoder = ProStrEncoder(config["model"]).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    # weights_only=False required: v2 checkpoints contain a config dict
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     encoder.load_state_dict(ckpt["encoder"])
+    # Restore transformer activation from checkpoint phase (v2 only)
+    if ckpt.get("phase", 1) == 2:
+        encoder.use_transformer = True
     for p in encoder.parameters():
         p.requires_grad_(False)
 
