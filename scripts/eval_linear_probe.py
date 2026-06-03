@@ -4,13 +4,16 @@ Linear probe evaluation of frozen ProStrEncoder embeddings.
 Expects preprocessed .pt files augmented with a `label` field (int64 scalar
 per protein, e.g., SCOP fold class).
 
+Probe hyperparameters (epochs, lr, weight_decay) are read from the YAML
+config under the `evaluation:` section; CLI args override them.
+
 Usage:
-    python scripts/eval_linear_probe.py \
-        --checkpoint checkpoints/ckpt_epoch010_val0.1234.pt \
-        --train_dir  data/scop/train \
-        --test_dir   data/scop/test \
-        --config     configs/default.yaml \
-        --num_classes 1195 \
+    python scripts/eval_linear_probe.py \\
+        --checkpoint checkpoints/ckpt_epoch010_val0.1234.pt \\
+        --train_dir  data/scop/train \\
+        --test_dir   data/scop/test \\
+        --config     configs/default.yaml \\
+        --num_classes 1195 \\
         --device     cuda
 """
 import argparse
@@ -48,9 +51,10 @@ def extract_embeddings(encoder, loader, device):
 
 
 def train_linear_head(X_train, y_train, X_test, y_test,
-                      num_classes, epochs=100, lr=1e-2):
-    head = nn.Linear(X_train.shape[1], num_classes)
-    opt  = AdamW(head.parameters(), lr=lr, weight_decay=1e-4)
+                      num_classes, epochs, lr, weight_decay):
+    """Train a linear probe on frozen embeddings and return test accuracy."""
+    head    = nn.Linear(X_train.shape[1], num_classes)
+    opt     = AdamW(head.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.CrossEntropyLoss()
 
     for epoch in range(1, epochs + 1):
@@ -74,17 +78,39 @@ def train_linear_head(X_train, y_train, X_test, y_test,
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint",  required=True)
-    parser.add_argument("--train_dir",   required=True)
-    parser.add_argument("--test_dir",    required=True)
-    parser.add_argument("--config",      default="configs/default.yaml")
-    parser.add_argument("--num_classes", type=int, required=True)
-    parser.add_argument("--device",      default="cpu")
+    parser = argparse.ArgumentParser(
+        description="Linear probe evaluation of frozen ProStrEncoder embeddings."
+    )
+    parser.add_argument("--checkpoint",    required=True,
+                        help="Path to encoder checkpoint .pt file")
+    parser.add_argument("--train_dir",     required=True,
+                        help="Labelled train split directory")
+    parser.add_argument("--test_dir",      required=True,
+                        help="Labelled test split directory")
+    parser.add_argument("--config",        default="configs/default.yaml",
+                        help="YAML config (model arch + evaluation defaults)")
+    parser.add_argument("--num_classes",   type=int, required=True,
+                        help="Number of classification labels")
+    parser.add_argument("--device",        default="cpu")
+    # Optional CLI overrides for probe hyperparams
+    parser.add_argument("--probe_epochs",       type=int,   default=None,
+                        help="Probe training epochs (overrides config.evaluation.probe_epochs)")
+    parser.add_argument("--probe_lr",           type=float, default=None,
+                        help="Probe learning rate (overrides config.evaluation.probe_lr)")
+    parser.add_argument("--probe_weight_decay", type=float, default=None,
+                        help="Probe weight decay (overrides config.evaluation.probe_weight_decay)")
     args = parser.parse_args()
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
+
+    # Probe hyperparams: CLI > YAML > built-in fallback
+    eval_cfg = config.get("evaluation", {})
+    probe_epochs  = args.probe_epochs       if args.probe_epochs       is not None else eval_cfg.get("probe_epochs",       100)
+    probe_lr      = args.probe_lr           if args.probe_lr           is not None else eval_cfg.get("probe_lr",           0.01)
+    probe_wd      = args.probe_weight_decay if args.probe_weight_decay is not None else eval_cfg.get("probe_weight_decay", 1e-4)
+
+    print(f"Probe config: epochs={probe_epochs}  lr={probe_lr}  weight_decay={probe_wd}")
 
     device = torch.device(args.device)
     encoder = ProStrEncoder(config["model"]).to(device)
@@ -104,8 +130,13 @@ def main():
 
     print(f"Train: {X_train.shape}, Test: {X_test.shape}")
     print("Training linear probe …")
-    acc = train_linear_head(X_train, y_train, X_test, y_test,
-                            num_classes=args.num_classes)
+    acc = train_linear_head(
+        X_train, y_train, X_test, y_test,
+        num_classes=args.num_classes,
+        epochs=probe_epochs,
+        lr=probe_lr,
+        weight_decay=probe_wd,
+    )
     print(f"\nFinal test accuracy: {acc:.4f}")
 
 
