@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Sentinel for the scalar_act default — avoids the mutable-default-argument
+# trap where all GVP instances would share a single activation object.
+_ACT_DEFAULT = object()
+
 
 class GVP(nn.Module):
     """
@@ -15,7 +19,7 @@ class GVP(nn.Module):
     """
 
     def __init__(self, in_dims: tuple, out_dims: tuple,
-                 scalar_act=nn.ReLU(), vector_gate: bool = True):
+                 scalar_act=_ACT_DEFAULT, vector_gate: bool = True):
         super().__init__()
         s_in, v_in = in_dims
         s_out, v_out = out_dims
@@ -38,7 +42,11 @@ class GVP(nn.Module):
         else:
             self.gate_linear = None
 
-        self.scalar_act = scalar_act
+        # Create a fresh activation per instance (avoids shared-state from mutable default)
+        if scalar_act is _ACT_DEFAULT:
+            self.scalar_act = nn.ReLU()
+        else:
+            self.scalar_act = scalar_act
 
     @staticmethod
     def _vec_linear(W: nn.Linear, V: torch.Tensor) -> torch.Tensor:
@@ -114,6 +122,12 @@ class GVPConv(nn.Module):
         # Scalar residual projection when dims differ
         self.res_proj = nn.Linear(s_n, s_o, bias=False) if s_n != s_o else nn.Identity()
 
+        # Vector residual: projects v_n channels → v_o channels (no bias; equivariant).
+        # Without this, vector norms grow unboundedly across layers.
+        self._res_v_needs_proj = (v_n != v_o)
+        if self._res_v_needs_proj:
+            self.res_v_proj = nn.Linear(v_n, v_o, bias=False)
+
     def forward(self, node_s, node_v, edge_index, edge_s, edge_v):
         """
         node_s : (N, s_n)    node_v : (N, v_n, 3)
@@ -152,5 +166,12 @@ class GVPConv(nn.Module):
         new_s, new_v = self.upd2(new_s, new_v)
 
         new_s = self.norm_s(self.drop(new_s) + self.res_proj(node_s))
+
+        # Vector residual — maintains equivariance (contracts on channel dim, not spatial)
+        if self._res_v_needs_proj:
+            res_v = GVP._vec_linear(self.res_v_proj, node_v)  # (N, v_o, 3)
+        else:
+            res_v = node_v
+        new_v = new_v + res_v
 
         return new_s, new_v

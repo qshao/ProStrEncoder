@@ -23,10 +23,14 @@ class WalkSampler(nn.Module):
 
     CLS_TOKEN: int = 21
 
-    def __init__(self, num_walks: int = 8, walk_length: int = 20):
+    def __init__(self, num_walks: int = 8, walk_length: int = 20,
+                 max_deg_cap: int = 30):
         super().__init__()
         self.num_walks = num_walks
         self.walk_length = walk_length
+        # Upper bound on node out-degree. Set to k_neighbors to avoid a
+        # GPU→CPU sync (degree.max().item()) on every forward pass.
+        self.max_deg_cap = max_deg_cap
 
     def forward(self, edge_index: torch.Tensor,
                 seq_idx: torch.Tensor) -> torch.Tensor:
@@ -43,7 +47,9 @@ class WalkSampler(nn.Module):
         # ── Build padded adjacency tensor ─────────────────────────────────────
         degree = torch.zeros(N, dtype=torch.long, device=device)
         degree.scatter_add_(0, src, torch.ones_like(src))
-        max_deg = max(int(degree.max().item()), 1)
+        # Use the pre-configured cap (= k_neighbors) instead of degree.max().item()
+        # to avoid stalling the GPU pipeline with a host-device sync every step.
+        max_deg = max(self.max_deg_cap, 1)
 
         # Sort edges by source node so we can compute within-group slot indices
         order = src.argsort(stable=True)

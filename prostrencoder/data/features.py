@@ -1,4 +1,6 @@
 import numpy as np
+import torch
+from torch_geometric.data import Data
 
 
 AA_CODES = [
@@ -53,6 +55,11 @@ def compute_backbone_frame(backbone_coords: np.ndarray) -> np.ndarray:
 
 
 def _dihedral(p0, p1, p2, p3) -> float:
+    # Guard: NaN inputs (missing backbone atoms) → return 0 instead of propagating NaN.
+    # The norm-based guard below uses `< 1e-6` which evaluates False for NaN.
+    if (np.any(np.isnan(p0)) or np.any(np.isnan(p1)) or
+            np.any(np.isnan(p2)) or np.any(np.isnan(p3))):
+        return 0.0
     b1 = p1 - p0
     b2 = p2 - p1
     b3 = p3 - p2
@@ -117,7 +124,8 @@ def compute_torsion_angles(backbone_coords: np.ndarray) -> np.ndarray:
             out[i, 4] = np.sin(omega)
             out[i, 5] = np.cos(omega)
 
-    return out
+    # Belt-and-suspenders: clamp any residual NaN to 0 (sin/cos of 0 = 0/1)
+    return np.nan_to_num(out, nan=0.0)
 
 
 def rbf_encoding(distances: np.ndarray, num_rbf: int = 16,
@@ -129,7 +137,7 @@ def rbf_encoding(distances: np.ndarray, num_rbf: int = 16,
     Returns   : (E, num_rbf) float32
     """
     centers = np.linspace(d_min, d_max, num_rbf, dtype=np.float32)
-    sigma = (d_max - d_min) / (num_rbf - 1)
+    sigma = (d_max - d_min) / max(num_rbf - 1, 1)
     return np.exp(-((distances[:, None] - centers[None, :]) ** 2) / (2 * sigma ** 2))
 
 
@@ -144,3 +152,48 @@ def compute_edge_directions(ca_coords: np.ndarray,
     src, dst = edge_index[0], edge_index[1]
     diff = ca_coords[dst] - ca_coords[src]
     return (diff / (edge_dist[:, None] + 1e-8)).astype(np.float32)
+
+
+def build_pyg_data(
+    seq_idx: np.ndarray,
+    ca_coords: np.ndarray,
+    backbone_coords: np.ndarray,
+    edge_index: np.ndarray,
+    edge_dist: np.ndarray,
+) -> Data:
+    """
+    Assemble a PyG Data object from raw protein arrays.
+
+    Single source of truth for feature computation used by both
+    scripts/preprocess.py (real PDB data) and scripts/make_toy_dataset.py
+    (synthetic data), ensuring identical feature layouts.
+
+    Args:
+        seq_idx          : (N,) int64  — AA indices 0–20
+        ca_coords        : (N, 3) float32
+        backbone_coords  : (N, 4, 3) float32  — N, CA, C, O per residue
+        edge_index       : (2, E) int64
+        edge_dist        : (E,) float32
+
+    Returns PyG Data with fields:
+        seq_idx, x_scalar (N,27), x_vec (N,3,3),
+        edge_index, edge_scalar (E,16), edge_vec (E,1,3)
+    """
+    onehot  = aa_one_hot(seq_idx)                                   # (N, 21)
+    torsion = compute_torsion_angles(backbone_coords)               # (N, 6)
+    frame   = compute_backbone_frame(backbone_coords)               # (N, 3, 3)
+    rbf     = rbf_encoding(edge_dist)                               # (E, 16)
+    dirs    = compute_edge_directions(ca_coords, edge_index,
+                                      edge_dist)                    # (E, 3)
+
+    x_scalar = np.concatenate([onehot, torsion], axis=1).astype(np.float32)
+    e_vec    = dirs[:, np.newaxis, :].astype(np.float32)            # (E, 1, 3)
+
+    return Data(
+        seq_idx=torch.from_numpy(seq_idx),
+        x_scalar=torch.from_numpy(x_scalar),
+        x_vec=torch.from_numpy(frame),
+        edge_index=torch.from_numpy(edge_index),
+        edge_scalar=torch.from_numpy(rbf),
+        edge_vec=torch.from_numpy(e_vec),
+    )
